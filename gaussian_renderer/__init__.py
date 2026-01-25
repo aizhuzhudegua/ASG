@@ -83,7 +83,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
     # local_feature = cat_local_view
     # concatenate and filter by mask
     if pc.enable_ref:
-        concatenated = torch.cat([local_feature, grid_scaling, anchor], dim=-1)
+        concatenated = torch.cat([feat,local_feature, grid_scaling, anchor], dim=-1)
         concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, tint, roughness], dim=-1)
     else:
@@ -97,9 +97,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
 
     # split attributes
     if pc.enable_idiv and pc.enable_ref:
-        features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness, idiv = masked.split([pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1, 3], dim=-1)
+        feat_repeat, features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness, idiv = masked.split(32,[pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1, 3], dim=-1)
     elif pc.enable_ref:
-        features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness = masked.split([pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1], dim=-1)
+        feat_repeat, features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness = masked.split(32,[pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1], dim=-1)
     elif pc.enable_idiv:
         scaling_repeat, repeat_anchor, color, scale_rot, offsets, idiv = masked.split([6, 3, 3, 7, 3, 3], dim=-1)
     else:
@@ -146,12 +146,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
     specular_color = 0
     if pc.enable_ref:
         # integrated directional embedding
-        reflect_dir = reflect(-dir_pp_normalized, normal)
-        # reflect_dir = reflect(-repeat_view, normal)
-        ide = pc.ide_fn(reflect_dir, roughness)
+        # reflect_dir = reflect(-dir_pp_normalized, normal)
+        # # reflect_dir = reflect(-repeat_view, normal)
+        # ide = pc.ide_fn(reflect_dir, roughness)
 
-        specular_color = pc.get_specular_mlp(torch.cat([ide, dotprod, features], dim=-1))
-        specular_color = specular_color.reshape([-1, 3])
+        # specular_color = pc.get_specular_mlp(torch.cat([ide, dotprod, features], dim=-1))
+        # specular_color = specular_color.reshape([-1, 3])
+        dir_pp = xyz - viewpoint_camera.camera_center.repeat(xyz.shape[0], 1)
+        dir_pp_normalized = (dir_pp / dir_pp.norm(dim=1, keepdim=True)).detach() # from camera to object
+        specular_color = pc.get_specular_mlp(feat_repeat, dir_pp_normalized, normal)
         specular_color = specular_color
 
     out.update({"color": specular_color + diffuse_color})

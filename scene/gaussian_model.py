@@ -24,6 +24,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.ref_utils import generate_ide_fn
 from scene.embedding import Embedding
+from utils.spec_utils import SpecularNetwork, AnchorSpecularNetwork
 
 TINT_ROUGH_SEP = True
 HYBRID_IMP_2 = False
@@ -213,12 +214,7 @@ class GaussianModel:
                 ).cuda()
 
             # Inputs: feature (feat_dim + 3), n*view (1), IDE (38 or 72), others
-            self.mlp_specular = nn.Sequential(
-                nn.Linear(self.spec_dim+self.appearance_dim, feat_dim),
-                nn.ReLU(True),
-                nn.Linear(feat_dim, 3),
-                nn.Softplus()
-            ).cuda()
+            self.mlp_specular = AnchorSpecularNetwork(feature_dims=feat_dim).cuda()
 
     def eval(self):
         self.mlp_opacity.eval()
