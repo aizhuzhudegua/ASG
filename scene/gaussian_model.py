@@ -24,10 +24,59 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.ref_utils import generate_ide_fn
 from scene.embedding import Embedding
-from utils.spec_utils import SpecularNetwork, AnchorSpecularNetwork
+from utils.spec_utils import AnchorSpecularNetwork
+import nvdiffrast.torch
 
 TINT_ROUGH_SEP = True
 HYBRID_IMP_2 = False
+
+class SphMipEncoding(nn.Module):
+    def __init__(
+        self,
+        n_levels: int = 8,
+        plane_size: int = 512,
+        feature_dim: int = 16,
+        Sn: int = 1,
+        dim: int = 1,
+        rand_init: bool = False
+    ):
+        super(SphMipEncoding, self).__init__()
+        self.n_levels = n_levels
+        self.plane_size = plane_size
+        
+        self.register_parameter("fm", nn.Parameter(torch.zeros(Sn, dim, plane_size, 2*plane_size, feature_dim)),)
+        
+        if rand_init:
+            self.init_parameters()
+
+    def init_parameters(self) -> None:
+        nn.init.uniform_(self.fm, -1e-2, 1e-2)
+        
+    def forward(self, x, level, index=0, weight=False):
+        """
+        x: [0,1], Nx3
+        level: [0, max_level], Nx1
+        """
+        x[..., 0] = x[..., 0] * 0.5 + 0.25
+        
+        decomposed_x = x
+        
+        level = torch.broadcast_to(level, decomposed_x.shape[:3]).contiguous()
+        
+        fm = self.fm[index]  # [N, L, 2L, feat_dim]
+        
+        padding_fm = torch.cat([fm[:, :, self.plane_size:, :], fm, fm[:, :, :self.plane_size, :]], dim=2)
+        
+        enc = nvdiffrast.torch.texture(
+            padding_fm,
+            decomposed_x,
+            mip_level_bias=level*self.n_levels,
+            boundary_mode="clamp",
+            max_mip_level=self.n_levels - 1,
+        )
+        
+        enc = (enc.permute(1, 2, 0, 3).contiguous().view(x.shape[0], -1,))
+        return enc
 
 class GaussianModel:
 
@@ -212,9 +261,15 @@ class GaussianModel:
                     nn.Linear(feat_dim, 4*self.n_offsets),
                     nn.Softplus()
                 ).cuda()
-
+            ide_dim = 0
+            if self.deg_view == 4:
+                ide_dim = 38
+            elif self.deg_view == 5:
+                ide_dim = 72
+            else:
+                raise NotImplementedError('Only support IDE degree 4 or 5')
             # Inputs: feature (feat_dim + 3), n*view (1), IDE (38 or 72), others
-            self.mlp_specular = AnchorSpecularNetwork(feature_dims=feat_dim).cuda()
+            self.mlp_specular = AnchorSpecularNetwork(feature_dims=feat_dim,ide_dim=ide_dim).cuda()
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -992,8 +1047,22 @@ class GaussianModel:
                 roughness_mlp.save(os.path.join(path, 'roughness_mlp.pt'))
                 self.mlp_roughness.train()
 
+                # 保留你原有的eval/train上下文，仅修正trace部分
                 self.mlp_specular.eval()
-                specular_mlp = torch.jit.trace(self.mlp_specular, (torch.rand(1, self.spec_dim+self.appearance_dim).cuda()))
+                # ========== 关键修正开始 ==========
+                # 1. 获取网络实际的维度参数（从mlp_specular实例中取，而非用错误的self.feat_dim+6）
+                asg_feature = self.mlp_specular.asg_feature  # 对应网络的feature_dims
+                ide_dim = self.mlp_specular.ide_dim          # 对应网络的ide_dim=72（默认）
+
+                # 2. 构造forward所需的全部4个参数（顺序必须和forward(x, view, normal, ide)一致）
+                x = torch.rand(1, asg_feature).cuda()        # x维度=asg_feature（删除错误的+6）
+                view = torch.rand(1, 3).cuda()               # view固定3维（和网络forward中拼接逻辑匹配）
+                normal = torch.rand(1, 3).cuda()             # normal固定3维
+                ide = torch.rand(1, ide_dim).cuda()          # ide维度=72（网络默认）
+
+                # 3. 传入所有参数的元组进行trace（原代码只传了x，缺少3个参数）
+                specular_mlp = torch.jit.trace(self.mlp_specular, (x, view, normal, ide))
+                # ========== 关键修正结束 ==========
                 specular_mlp.save(os.path.join(path, 'specular_mlp.pt'))
                 self.mlp_specular.train()
 
