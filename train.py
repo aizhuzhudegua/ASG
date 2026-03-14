@@ -81,6 +81,40 @@ def saveRuntimeCode(dst: str) -> None:
     
     print('Backup Finished!')
 
+def get_linear_noise_func(
+        lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
+):
+    """
+    Copied from Plenoxels
+
+    Continuous learning rate decay function. Adapted from JaxNeRF
+    The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
+    is log-linearly interpolated elsewhere (equivalent to exponential decay).
+    If lr_delay_steps>0 then the learning rate will be scaled by some smooth
+    function of lr_delay_mult, such that the initial learning rate is
+    lr_init*lr_delay_mult at the beginning of optimization but will be eased back
+    to the normal learning rate when steps>lr_delay_steps.
+    :param conf: config subtree 'lr' or similar
+    :param max_steps: int, the number of steps during optimization.
+    :return HoF which takes step as input
+    """
+
+    def helper(step):
+        if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+            # Disable this parameter
+            return 0.0
+        if lr_delay_steps > 0:
+            # A kind of reverse cosine decay.
+            delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
+                0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
+            )
+        else:
+            delay_rate = 1.0
+        t = np.clip(step / max_steps, 0, 1)
+        log_lerp = lr_init * (1 - t) + lr_final * t
+        return delay_rate * log_lerp
+
+    return helper
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
@@ -101,22 +135,27 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    c2f_init_factor = 0.125
+    c2f_until_iter = 20_000
+    DownSampling = True
+    smooth_term = get_linear_noise_func(lr_init=c2f_init_factor, lr_final=1.0, lr_delay_mult=0.01,
+                                        max_steps=c2f_until_iter)
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        # if network_gui.conn == None:
+        #     network_gui.try_connect()
+        # while network_gui.conn != None:
+        #     try:
+        #         net_image_bytes = None
+        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+        #         if custom_cam != None:
+        #             net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+        #         network_gui.send(net_image_bytes, dataset.source_path)
+        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+        #             break
+        #     except Exception as e:
+        #         network_gui.conn = None
 
         iter_start.record()
 
@@ -145,72 +184,84 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
+        down_sampling = smooth_term(iteration) if DownSampling else 1
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad,
-                            render_n=render_n, render_dotprod=reg_back_normal, render_full=render_full)
+                            render_n=render_n, render_dotprod=reg_back_normal, render_full=render_full,down_sampling = down_sampling)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         # image = linear_to_srgb(image)
-
+        
         image = torch.clamp(image, 0.0, 1.0)
 
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        ssim_loss = (1.0 - ssim(image, gt_image))
-
+        cur_size = (int(gt_image.shape[1] * down_sampling), int(gt_image.shape[2] * down_sampling))
+        if DownSampling:
+            gt_image_cur = F.interpolate(gt_image.unsqueeze(0), size=cur_size, mode='bilinear',
+                                     align_corners=False).squeeze(0)
+        
+            Ll1 = l1_loss(image, gt_image_cur)
+            ssim_loss = (1.0 - ssim(image, gt_image_cur))
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
-        if opt.plate:
-            sorted_scale, _ = torch.sort(scaling, dim=-1)
-            min_scale_loss = sorted_scale[...,0]
-            loss += 100.0*min_scale_loss.mean()
+        # if opt.plate:
+        #     sorted_scale, _ = torch.sort(scaling, dim=-1)
+        #     min_scale_loss = sorted_scale[...,0]
+        #     loss += 100.0*min_scale_loss.mean()
 
-        # Add Extra Loss
-        if reg_pred_normal or reg_tv:
-            alpha = render_pkg["alpha"].detach()[0] # H, W
-            # alpha = render_pkg["alpha"][0] # H, W
-            normal = render_pkg["normal"]
-            depth = render_pkg["depth"][0] # view space
-            surface_mask = alpha > opt.omit_opacity_threshold # H, W
-            # if iteration > 15000 and opt.use_normalized_attributes:
-            if opt.use_normalized_attributes:
-                normal = normalize_rendered_by_weights(normal, alpha, opt.omit_opacity_threshold)
-                # depth = normalize_rendered_by_weights(depth, alpha, opt.omit_opacity_threshold)
+        # # Add Extra Loss
+        # if reg_pred_normal or reg_tv:
+        #     alpha = render_pkg["alpha"].detach()[0] # H, W
+        #     # alpha = render_pkg["alpha"][0] # H, W
+        #     normal = render_pkg["normal"]
+        #     depth = render_pkg["depth"][0] # view space
+        #     surface_mask = alpha > opt.omit_opacity_threshold # H, W
+        #     # if iteration > 15000 and opt.use_normalized_attributes:
+        #     if opt.use_normalized_attributes:
+        #         normal = normalize_rendered_by_weights(normal, alpha, opt.omit_opacity_threshold)
+        #         # depth = normalize_rendered_by_weights(depth, alpha, opt.omit_opacity_threshold)
 
-        losses_extra = {}
-        if reg_back_normal:
-            dotprod_img = render_pkg["dotprod"]
-            losses_extra["back_normal"] = dotprod_img.mean()
-        if reg_pred_normal:
-            # lambda_decay = pred_normal_smooth(iteration - opt.depth_normal_start)
-            # if (iteration % 1000 == 0):
-            #     print("\n", lambda_decay)
-            if opt.use_normalized_attributes:
-                normal_from_depth = render_normal_from_depth(viewpoint_cam, depth)
-                losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
-            else:
-                normal_from_depth = render_normal_from_depth(viewpoint_cam, depth) * alpha
-                losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
-        if reg_tv:
-            losses_extra["tv"] = 0.0
-            if opt.tv_normal:
-                losses_extra["tv"] += total_variation(normal, surface_mask)
-                # surface_mask_ = surface_mask[None, ...].repeat(3, 1, 1)
-                # curv_n = normal2curv(normal, surface_mask_)
-                # losses_extra["tv"] += l1_loss(curv_n * 1, 0)
+        # losses_extra = {}
+        # if reg_back_normal:
+        #     dotprod_img = render_pkg["dotprod"]
+        #     losses_extra["back_normal"] = dotprod_img.mean()
+        # if reg_pred_normal:
+        #     # lambda_decay = pred_normal_smooth(iteration - opt.depth_normal_start)
+        #     # if (iteration % 1000 == 0):
+        #     #     print("\n", lambda_decay)
+        #     if opt.use_normalized_attributes:
+        #         normal_from_depth = render_normal_from_depth(viewpoint_cam, depth)
+        #         losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
+        #     else:
+        #         normal_from_depth = render_normal_from_depth(viewpoint_cam, depth) * alpha
+        #         losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
+        # if reg_tv:
+        #     losses_extra["tv"] = 0.0
+        #     if opt.tv_normal:
+        #         losses_extra["tv"] += total_variation(normal, surface_mask)
+        #         # surface_mask_ = surface_mask[None, ...].repeat(3, 1, 1)
+        #         # curv_n = normal2curv(normal, surface_mask_)
+        #         # losses_extra["tv"] += l1_loss(curv_n * 1, 0)
 
-        if reg_opacity:
-            opacity_mask = torch.gt(opacity, 0.01) * torch.le(opacity, 0.99)
-            losses_extra['reg_opacity'] = cross_entropy_loss(opacity * opacity_mask)
+        # if reg_opacity:
+        #     opacity_mask = torch.gt(opacity, 0.01) * torch.le(opacity, 0.99)
+        #     losses_extra['reg_opacity'] = cross_entropy_loss(opacity * opacity_mask)
 
-        for k in losses_extra.keys():
-            loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
+        # for k in losses_extra.keys():
+        #     loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
 
         loss.backward()
         
         iter_end.record()
 
         with torch.no_grad():
+            if DownSampling:
+                del gt_image_cur
+                if iteration % 100 == 0:
+                    torch.cuda.empty_cache()
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
@@ -219,7 +270,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
-
+            
             # Log and save
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
@@ -233,6 +284,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                    # logger.info("\n[ITER {}] adjust_anchor".format(iteration))
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
@@ -291,6 +343,8 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssims_test = 0.0
+                lpips = 0.0
                 
                 if wandb is not None:
                     gt_image_list = []
@@ -302,7 +356,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
                     # image = renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"]
                     # image = linear_to_srgb(image)
-                    # image = torch.clamp(image, 0.0, 1.0)
+                    image = torch.clamp(image, 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -319,12 +373,15 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
-
+                    lpips += lpips_fn(image, gt_image).mean().double()
+                    ssims_test += ssim(image, gt_image).mean().double()
                 
                 
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])  
+                lpips /= len(config['cameras'])      
+                ssims_test /= len(config['cameras'])      
+                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssims_test,lpips))
 
                 
                 if tb_writer:
